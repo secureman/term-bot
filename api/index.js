@@ -13,6 +13,9 @@ const client = new TwitterApi({
 // In-memory storage
 let currentTerm = null;
 
+// Constants
+const STATIC_HASHTAGS = '#linguistics #languages #arabic #arabic_dialects';
+
 // Enhanced error logging function
 function logError(context, error) {
   const errorDetails = {
@@ -20,7 +23,6 @@ function logError(context, error) {
     message: error.message,
     stack: error.stack,
     timestamp: new Date().toISOString(),
-    // If the error is from Twitter API, include more details
     twitterError: error.data ? {
       code: error.code,
       data: error.data
@@ -29,6 +31,14 @@ function logError(context, error) {
   
   console.error('Detailed Error Log:', JSON.stringify(errorDetails, null, 2));
   return errorDetails;
+}
+
+function extractDialectHashtag(origin) {
+  if (!origin || origin === "No origin available") return "";
+  
+  // Clean up the origin text and convert to hashtag
+  const dialect = origin.split(/[,\s]/)[0].trim(); // Take first word of dialect
+  return dialect ? `#${dialect}` : "";
 }
 
 async function getPageContent(url) {
@@ -88,28 +98,43 @@ async function getRandomTerm() {
       throw new Error(`Failed to extract term details from ${termPageUrl}`);
     }
 
-    const termContent = `Term: ${termHeading}\nDefinition: ${definition}\nExample: ${example}\nMostly Used (Dialect): ${origin}`;
-    console.log('Successfully generated term content:', termContent);
-    return termContent;
-
+    return {
+      content: `Term: ${termHeading}\nDefinition: ${definition}\nExample: ${example}\nMostly Used (Dialect): ${origin}`,
+      origin: origin
+    };
   } catch (error) {
     const errorDetails = logError('Error in getRandomTerm', error);
     throw new Error(`Failed to get random term: ${errorDetails.message}`);
   }
 }
 
-async function postToTwitter(term) {
+async function postToTwitter(term, origin) {
   try {
-    console.log('Attempting to post to Twitter:', term);
+    console.log('Preparing tweet content...');
     
-    // Check if the term is too long for Twitter
-    if (term.length > 280) {
-      console.log('Term is too long, truncating...');
-      term = term.substring(0, 277) + '...';
+    // Extract dialect hashtag
+    const dialectHashtag = extractDialectHashtag(origin);
+    
+    // Combine content with hashtags
+    let tweetContent = `${term}\n\n${STATIC_HASHTAGS}`;
+    if (dialectHashtag) {
+      tweetContent += ` ${dialectHashtag}`;
     }
     
-    const tweet = await client.v2.tweet(term);
-    console.log('Successfully posted to Twitter:', tweet.data);
+    // Check tweet length and truncate if necessary
+    if (tweetContent.length > 280) {
+      console.log('Tweet content too long, truncating...');
+      const hashtagsLength = (STATIC_HASHTAGS + ' ' + dialectHashtag).length;
+      const maxContentLength = 277 - hashtagsLength; // 280 - 3 for ellipsis
+      tweetContent = `${term.substring(0, maxContentLength)}...\n\n${STATIC_HASHTAGS}`;
+      if (dialectHashtag) {
+        tweetContent += ` ${dialectHashtag}`;
+      }
+    }
+    
+    console.log('Posting tweet:', tweetContent);
+    const tweet = await client.v2.tweet(tweetContent);
+    console.log('Successfully posted tweet:', tweet.data);
     return tweet.data.id;
   } catch (error) {
     const errorDetails = logError('Error posting to Twitter', error);
@@ -124,10 +149,11 @@ async function handleRequest(req, res) {
     try {
       if (!currentTerm) {
         console.log('No current term, fetching new one...');
-        currentTerm = await getRandomTerm();
+        const termData = await getRandomTerm();
+        currentTerm = termData;
       }
       console.log('Returning current term');
-      res.status(200).json({ term: currentTerm });
+      res.status(200).json({ term: currentTerm.content, origin: currentTerm.origin });
     } catch (error) {
       const errorDetails = logError('Error handling GET request', error);
       res.status(500).json({
@@ -155,7 +181,7 @@ async function handleRequest(req, res) {
         }
 
         console.log('Approving current term for Twitter posting');
-        const tweetId = await postToTwitter(currentTerm);
+        const tweetId = await postToTwitter(currentTerm.content, currentTerm.origin);
         const tweetUrl = `https://twitter.com/user/status/${tweetId}`;
         console.log('Successfully posted to Twitter:', tweetUrl);
         
