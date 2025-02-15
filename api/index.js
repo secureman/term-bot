@@ -10,10 +10,11 @@ const client = new TwitterApi({
   accessSecret: 'K3BiGt8sIm8fG9gGNfQYA4q0wnC8rUYjp8sHXm8jG18ZP',
 });
 
-// In-memory storage
+// In-memory storage with rate limit tracking
 let currentTerm = null;
 let lastTweetTime = null;
-const TWEET_COOLDOWN = 60000; // 1 minute cooldown between tweets
+let rateLimitResetTime = null;
+const TWEET_COOLDOWN = 180000; // 3 minutes cooldown between tweets
 
 // Constants
 const STATIC_HASHTAGS = '#linguistics #languages #arabic #arabic_dialects';
@@ -37,6 +38,11 @@ function logError(context, error) {
 
 // Rate limit check function
 function checkRateLimit() {
+  if (rateLimitResetTime && Date.now() < rateLimitResetTime) {
+    const waitSeconds = Math.ceil((rateLimitResetTime - Date.now()) / 1000);
+    throw new Error(`Rate limit in effect. Please wait ${waitSeconds} seconds.`);
+  }
+  
   if (!lastTweetTime) return true;
   const timeSinceLastTweet = Date.now() - lastTweetTime;
   return timeSinceLastTweet >= TWEET_COOLDOWN;
@@ -144,32 +150,22 @@ async function postToTwitter(term, origin) {
     
     console.log('Posting tweet:', tweetContent);
     
-    // Implement exponential backoff for Twitter API calls
-    let attempts = 0;
-    const maxAttempts = 3;
-    const baseDelay = 1000; // 1 second
-
-    while (attempts < maxAttempts) {
-      try {
-        const tweet = await client.v2.tweet(tweetContent);
-        lastTweetTime = Date.now();
-        console.log('Successfully posted tweet:', tweet.data);
-        return tweet.data.id;
-      } catch (twitterError) {
-        attempts++;
-        if (twitterError.code === 429) { // Rate limit error
-          if (attempts === maxAttempts) throw twitterError;
-          const delay = baseDelay * Math.pow(2, attempts);
-          console.log(`Rate limited. Waiting ${delay}ms before retry ${attempts}/${maxAttempts}`);
-          await new Promise(resolve => setTimeout(resolve, delay));
-        } else {
-          throw twitterError;
-        }
+    try {
+      const tweet = await client.v2.tweet(tweetContent);
+      lastTweetTime = Date.now();
+      console.log('Successfully posted tweet:', tweet.data);
+      return tweet.data.id;
+    } catch (twitterError) {
+      if (twitterError.code === 429) {
+        // Set rate limit reset time to 15 minutes from now
+        rateLimitResetTime = Date.now() + (15 * 60 * 1000);
+        throw new Error(`Twitter rate limit exceeded. Please try again in 15 minutes.`);
       }
+      throw twitterError;
     }
   } catch (error) {
     const errorDetails = logError('Error posting to Twitter', error);
-    throw new Error(`Twitter post failed: ${error.message}`);
+    throw new Error(error.message || 'Failed to post to Twitter');
   }
 }
 
@@ -211,11 +207,12 @@ async function handleRequest(req, res) {
           });
         }
 
-        if (!checkRateLimit()) {
-          const waitTime = Math.ceil((TWEET_COOLDOWN - (Date.now() - lastTweetTime)) / 1000);
+        try {
+          checkRateLimit();
+        } catch (rateLimitError) {
           return res.status(429).json({
             error: 'Rate limit exceeded',
-            userMessage: `Please wait ${waitTime} seconds before posting another tweet.`
+            userMessage: rateLimitError.message
           });
         }
 
@@ -239,17 +236,16 @@ async function handleRequest(req, res) {
           message: 'Term disapproved',
           userMessage: 'Term was disapproved. You can now fetch a new term.'
         });
-
       } else {
         throw new Error(`Invalid action: ${action}`);
       }
-
     } catch (error) {
       const errorDetails = logError('Error processing POST request', error);
-      res.status(500).json({
+      const status = error.message.includes('rate limit') ? 429 : 500;
+      res.status(status).json({
         error: 'Action processing failed',
         details: errorDetails,
-        userMessage: `Failed to process your request: ${error.message}`
+        userMessage: error.message
       });
     }
   } else {
