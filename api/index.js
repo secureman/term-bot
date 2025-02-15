@@ -12,6 +12,8 @@ const client = new TwitterApi({
 
 // In-memory storage
 let currentTerm = null;
+let lastTweetTime = null;
+const TWEET_COOLDOWN = 60000; // 1 minute cooldown between tweets
 
 // Constants
 const STATIC_HASHTAGS = '#linguistics #languages #arabic #arabic_dialects';
@@ -31,6 +33,13 @@ function logError(context, error) {
   
   console.error('Detailed Error Log:', JSON.stringify(errorDetails, null, 2));
   return errorDetails;
+}
+
+// Rate limit check function
+function checkRateLimit() {
+  if (!lastTweetTime) return true;
+  const timeSinceLastTweet = Date.now() - lastTweetTime;
+  return timeSinceLastTweet >= TWEET_COOLDOWN;
 }
 
 function extractDialectHashtag(origin) {
@@ -110,22 +119,23 @@ async function getRandomTerm() {
 
 async function postToTwitter(term, origin) {
   try {
+    if (!checkRateLimit()) {
+      const waitTime = Math.ceil((TWEET_COOLDOWN - (Date.now() - lastTweetTime)) / 1000);
+      throw new Error(`Rate limit exceeded. Please wait ${waitTime} seconds before posting again.`);
+    }
+
     console.log('Preparing tweet content...');
     
-    // Extract dialect hashtag
     const dialectHashtag = extractDialectHashtag(origin);
-    
-    // Combine content with hashtags
     let tweetContent = `${term}\n\n${STATIC_HASHTAGS}`;
     if (dialectHashtag) {
       tweetContent += ` ${dialectHashtag}`;
     }
     
-    // Check tweet length and truncate if necessary
     if (tweetContent.length > 280) {
       console.log('Tweet content too long, truncating...');
       const hashtagsLength = (STATIC_HASHTAGS + ' ' + dialectHashtag).length;
-      const maxContentLength = 277 - hashtagsLength; // 280 - 3 for ellipsis
+      const maxContentLength = 277 - hashtagsLength;
       tweetContent = `${term.substring(0, maxContentLength)}...\n\n${STATIC_HASHTAGS}`;
       if (dialectHashtag) {
         tweetContent += ` ${dialectHashtag}`;
@@ -133,12 +143,33 @@ async function postToTwitter(term, origin) {
     }
     
     console.log('Posting tweet:', tweetContent);
-    const tweet = await client.v2.tweet(tweetContent);
-    console.log('Successfully posted tweet:', tweet.data);
-    return tweet.data.id;
+    
+    // Implement exponential backoff for Twitter API calls
+    let attempts = 0;
+    const maxAttempts = 3;
+    const baseDelay = 1000; // 1 second
+
+    while (attempts < maxAttempts) {
+      try {
+        const tweet = await client.v2.tweet(tweetContent);
+        lastTweetTime = Date.now();
+        console.log('Successfully posted tweet:', tweet.data);
+        return tweet.data.id;
+      } catch (twitterError) {
+        attempts++;
+        if (twitterError.code === 429) { // Rate limit error
+          if (attempts === maxAttempts) throw twitterError;
+          const delay = baseDelay * Math.pow(2, attempts);
+          console.log(`Rate limited. Waiting ${delay}ms before retry ${attempts}/${maxAttempts}`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        } else {
+          throw twitterError;
+        }
+      }
+    }
   } catch (error) {
     const errorDetails = logError('Error posting to Twitter', error);
-    throw new Error(`Twitter post failed: ${errorDetails.message}`);
+    throw new Error(`Twitter post failed: ${error.message}`);
   }
 }
 
@@ -177,6 +208,14 @@ async function handleRequest(req, res) {
           return res.status(400).json({
             error: 'No term to approve',
             userMessage: 'No term is currently available for approval. Please fetch a new term first.'
+          });
+        }
+
+        if (!checkRateLimit()) {
+          const waitTime = Math.ceil((TWEET_COOLDOWN - (Date.now() - lastTweetTime)) / 1000);
+          return res.status(429).json({
+            error: 'Rate limit exceeded',
+            userMessage: `Please wait ${waitTime} seconds before posting another tweet.`
           });
         }
 
